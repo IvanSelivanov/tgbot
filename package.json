@@ -1,0 +1,11 @@
+{
+  "name": "tgbot",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bot": "node bot.js"
+  },
+  "dependencies": {
+    "@vercel/functions": "^3.7.6"
+  }
+}

@@ -1,6 +1,6 @@
 {
   "functions": {
-    "api/*.rb": {
+    "api/*.js": {
       "maxDuration": 300
     }
   }

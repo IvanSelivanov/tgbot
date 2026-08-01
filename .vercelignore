@@ -1,5 +1,5 @@
 .env*
 
-bot.rb
+bot.js
 README.md
 .claude/

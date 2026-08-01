@@ -1,76 +1,82 @@
 # tgbot
 
 Личный Telegram-бот: пересылаешь голосовое — получаешь текст, а для длинных
-ещё и суть в двух строках. Ruby на Vercel, расшифровка через Gemini free tier.
+ещё и суть в двух строках. Node.js на Vercel, расшифровка через Gemini free tier.
 
-Дизайн-док: `~/.gstack/projects/tgbot/ivanselivanov-nogit-design-20260729-231744.md`
+## Архитектура: мгновенный ack + фон
 
-## Статус: не проверено на живом деплое
+Вебхук отвечает Telegram `200` за миллисекунды, а расшифровка уезжает в
+`waitUntil` из `@vercel/functions`. Это не оптимизация, а то, ради чего выбран
+Node.js — три ограничения исчезают разом:
 
-**Перед тем как пользоваться, надо пройти Этап 0.** В проекте есть один
-блокирующий вопрос без запасного плана и два с запасным.
+- **Нет порога длины от таймаута.** Telegram не ждёт ответа, значит длина
+  голосовухи упирается только в `maxDuration` (300 с) и лимиты Gemini.
+- **Нет дублей.** Telegram ретраит, когда не дождался ответа. Он дождался.
+- **Нечего ронять.** Ждать внутри запроса больше не нужно.
 
-### Проверка 1 (блокирующая): потолок длительности Ruby-функции
+### Почему не Ruby
 
-Лимит 300 секунд Vercel документирует для рантаймов Node.js и Python на Fluid
-Compute. **Ruby в списке Fluid-рантаймов отсутствует**, а легаси-потолок Hobby —
-60 секунд при дефолте 10. От ответа зависит, годится ли этот стек вообще.
+Изначально это было написано на Ruby. Замер на живом деплое показал: Ruby-билдер
+Vercel (`vc__handler__ruby.rb`) поднимает внутри лямбды WEBrick на `127.0.0.1:3000`
+и сам себе шлёт HTTP-запрос через `Net::HTTP.send_request`, не выставив
+`read_timeout`. Значит наследуется дефолт Ruby — **60 секунд**, и `maxDuration: 300`
+за этой границей ничего не значит.
+
+Хуже другое: при превышении WEBrick остаётся жить на порту 3000, а
+лямбда-контейнер переиспользуется. Каждый следующий запрос падает с
+`Errno::EADDRINUSE`. Одна медленная голосовуха ломала бы бота для всех
+последующих.
+
+Замеры: `sleep=50` → 200, `sleep=58` → 200, `sleep=90` → `Net::ReadTimeout`,
+дальше все запросы → `FUNCTION_INVOCATION_FAILED`.
+
+Node.js и Python — единственные рантаймы Vercel на Fluid Compute (300 с,
+Active CPU, `waitUntil`). Ruby и Go туда не входят.
+
+## Что ещё не проверено
+
+Два допущения, обозначенные в коде комментариями:
+
+1. **`GEMINI_MODEL`.** `gemini-2.5-flash` устарел, `2.0-flash` выключен.
+   Сверь актуальное имя в AI Studio.
+2. **`audio/ogg`.** Telegram шлёт OGG/**Opus**, а Gemini документирует
+   `audio/ogg` как OGG **Vorbis**. Примет ли он Opus — не документировано.
+   Если прилетит 400 на формате, это `lib/transcribe.js`.
+
+Проверяется одним запросом:
 
 ```bash
-npm i -g vercel
-vercel --prod
-
-curl "https://<project>.vercel.app/api/ping?sleep=5"
-curl "https://<project>.vercel.app/api/ping?sleep=30"
-curl "https://<project>.vercel.app/api/ping?sleep=90"
-```
-
-| Результат | Что делать |
-|---|---|
-| `sleep=90` вернул 200 | Всё хорошо, `MAX_VOICE_SECONDS=180` |
-| таймаут около 60 с | `MAX_VOICE_SECONDS=120`, следить за задержкой |
-| таймаут около 10 с | Ruby на Vercel не подходит. Менять рантайм или хост |
-
-### Проверка 2: Gemini — гео, формат, качество
-
-Telegram шлёт голосовые в OGG/**Opus**. Gemini документирует `audio/ogg` как
-OGG **Vorbis**. Примет ли он Opus — не документировано, а ffmpeg на Vercel
-взять неоткуда (потолок бандла для Ruby 250 МБ, Large Functions только для
-Node.js и Python).
-
-Скачай из Telegram реальную голосовуху и прогони:
-
-```bash
-ruby -e '
-  require "json"
-  audio = File.binread(ARGV[0])
-  body = {
+node -e '
+  const fs = require("fs");
+  const audio = fs.readFileSync(process.argv[1]).toString("base64");
+  fs.writeFileSync("/tmp/req.json", JSON.stringify({
     contents: [{ parts: [
       { text: "Расшифруй это голосовое дословно по-русски." },
-      { inline_data: { mime_type: "audio/ogg", data: [audio].pack("m0") } }
+      { inline_data: { mime_type: "audio/ogg", data: audio } }
     ]}]
-  }
-  File.write("/tmp/gemini-req.json", JSON.generate(body))
+  }));
 ' voice.ogg
 
 curl -s "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent" \
-  -H "Content-Type: application/json" \
-  -H "x-goog-api-key: $GEMINI_API_KEY" \
-  -d @/tmp/gemini-req.json | ruby -rjson -e 'puts JSON.parse(STDIN.read).dig("candidates",0,"content","parts",0,"text")'
+  -H "Content-Type: application/json" -H "x-goog-api-key: $GEMINI_API_KEY" \
+  -d @/tmp/req.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).candidates?.[0]?.content?.parts?.[0]?.text))'
 ```
 
-Если 400 на формате, или API недоступен из твоего региона, или русский текст
-плохой — переключаемся на Groq с `whisper-large-v3-turbo` (Approach C в доке,
-меняется только `lib/transcribe.rb`).
+Если Gemini не подойдёт — замена на Groq с `whisper-large-v3-turbo` меняет
+только `lib/transcribe.js`: интерфейс `transcribe(bytes) -> {summary, transcript}`
+специально узкий.
 
 ## Запуск локально
 
 ```bash
 cp .env.example .env    # заполнить
-ruby bot.rb
+npm install
+node --env-file=.env bot.js
 ```
 
-Полинг, работает пока открыт терминал. Логика ровно та же, что в проде.
+Полинг, работает пока открыт терминал. Логика ровно та же, что в проде —
+отличается только то, что здесь `handleUpdate` ждут, а на Vercel он уезжает
+в `waitUntil`.
 
 ## Деплой
 
@@ -83,7 +89,9 @@ vercel --prod
 ```
 
 Вебхук — **строго на продовый домен**. На Hobby Deployment Protection закрывает
-preview-URL, и Telegram будет молча получать 401, а логи живут час.
+URL деплоев: проверено, `tgbot-<hash>-<team>.vercel.app` отдаёт 302 на SSO,
+а продовый домен — 200. Направишь вебхук туда — Telegram будет молча получать
+редирект, а логи на Hobby живут час.
 
 ```bash
 curl "https://api.telegram.org/bot$BOT_TOKEN/setWebhook" \
@@ -100,36 +108,29 @@ curl "https://api.telegram.org/bot$BOT_TOKEN/setWebhook" \
 ## Структура
 
 ```
-api/ping.rb        проверка потолка длительности (Этап 0)
-api/index.rb       вебхук — обёртка ~20 строк
-bot.rb             локальный полинг — обёртка ~20 строк
-lib/handle.rb      ЯДРО: whitelist, пороги, индикатор, форматирование, ошибки
-lib/transcribe.rb  Gemini. Единственный файл, который меняется на Groq
-lib/telegram.rb    Bot API на net/http
-lib/env.rb         загрузка .env локально
+api/index.js       вебхук: проверка секрета, ack, waitUntil — ~20 строк
+bot.js             локальный полинг — ~20 строк
+lib/handle.js      ЯДРО: whitelist, пороги, индикатор, форматирование, ошибки
+lib/transcribe.js  Gemini — единственный файл, который меняется на Groq
+lib/telegram.js    Bot API на глобальном fetch
 ```
 
-Обе точки входа зовут `Handle.handle_update` — логика не продублирована.
+Обе точки входа зовут `handleUpdate` — логика не продублирована. `lib/handle.js`
+намеренно **не** импортирует `waitUntil`: фоновый запуск это забота точки входа,
+поэтому ядро одинаково в обоих режимах и переживёт смену хостинга.
 
-## Почему нет гемов
+## Зависимости
 
-Нужны четыре вызова Telegram и один Gemini. Стандартная библиотека это
-покрывает, а проект должен пережить полгода простоя: зависимость, которая
-обновляется чаще, чем ты открываешь проект, — это обязанность, которой быть
-не должно.
-
-Граница у принципа есть: формат запроса к Gemini — тоже внешняя зависимость,
-и она уже поехала. `generateContent` объявлен легаси, новые модели приземляются
-в Interactions API. `net/http` не гниёт — гниёт JSON, который в него кладут.
+Одна: `@vercel/functions` ради `waitUntil`. Всё остальное — глобальный `fetch`,
+`FormData`, `Buffer` из Node 18+.
 
 ## Известные ограничения
 
-- **Возможен дубль ответа**, если Gemini ответит дольше, чем Telegram ждёт
-  (~60 с). Защита одна — порог `MAX_VOICE_SECONDS`. Дедуп требовал бы внешнего
-  хранилища. Появятся дубли — снижай порог, а не заводи базу.
-- Только голосовые. Аудиофайлы часто больше 20 МБ, видеокружки у Gemini
-  примерно в восемь раз дороже.
+- Только голосовые. Аудиофайлы часто больше 20 МБ (`getFile` их не отдаёт),
+  видеокружки у Gemini примерно в восемь раз дороже (~258 токенов/с против 32).
+- Файлы больше ~14-15 МБ не пройдут инлайном в Gemini: лимит 20 МБ считается
+  на весь запрос, а base64 раздувает на треть.
 - Логи на Hobby живут час.
 - Hobby только для личного, некоммерческого использования.
 - Free tier Gemini обучается на твоих данных, живые ревьюеры могут их видеть.
-  Через бота поедут чужие голосовые.
+  Через бота поедут чужие голосовые, и их авторов никто не спрашивал.

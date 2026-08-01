@@ -3,10 +3,8 @@
 .env*
 !.env.example
 
-.vercel/
-vendor/bundle/
-.bundle/
-Gemfile.lock
+node_modules/
+.vercel
 *.log
 .DS_Store
 .claude/settings.local.json

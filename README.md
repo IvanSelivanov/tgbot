@@ -33,38 +33,40 @@ Vercel (`vc__handler__ruby.rb`) поднимает внутри лямбды WEB
 Node.js и Python — единственные рантаймы Vercel на Fluid Compute (300 с,
 Active CPU, `waitUntil`). Ruby и Go туда не входят.
 
-## Что ещё не проверено
+## Проверено на живом API
 
-Два допущения, обозначенные в коде комментариями:
+Оба главных допущения сняты 2026-08-01.
 
-1. **`GEMINI_MODEL`.** `gemini-2.5-flash` устарел, `2.0-flash` выключен.
-   Сверь актуальное имя в AI Studio.
-2. **`audio/ogg`.** Telegram шлёт OGG/**Opus**, а Gemini документирует
-   `audio/ogg` как OGG **Vorbis**. Примет ли он Opus — не документировано.
-   Если прилетит 400 на формате, это `lib/transcribe.js`.
+**Opus проходит.** Сгенерирован настоящий OGG/Opus (`OggS` + `OpusHead`, моно,
+48 кГц, 32 кбит/с — точный формат голосовых Telegram) и отправлен инлайном с
+`mime_type: audio/ogg`. Ответ `HTTP/2 200`. Конвертация и ffmpeg не нужны.
 
-Проверяется одним запросом:
+**Модель.** `gemini-3.1-flash-lite`. Выбрана ради квоты: 500 запросов в день.
+Расшифровка русской речи практически эталонная — на тестовой фразе не потеряно
+ничего, включая «стоматолог», «сорок две тысячи рублей» и «после одиннадцати».
+Саммари корректно вытащило дату, время, сумму и время звонка.
+
+Стоимость: **488 токенов на 15 секунд аудио** (подтверждает документированные
+32 токена/с), 588 на входе и 144 на выходе за весь запрос.
+
+Воспроизвести без реальной голосовухи (ffmpeg не нужен, только `opus-tools`):
 
 ```bash
-node -e '
-  const fs = require("fs");
-  const audio = fs.readFileSync(process.argv[1]).toString("base64");
-  fs.writeFileSync("/tmp/req.json", JSON.stringify({
-    contents: [{ parts: [
-      { text: "Расшифруй это голосовое дословно по-русски." },
-      { inline_data: { mime_type: "audio/ogg", data: audio } }
-    ]}]
-  }));
-' voice.ogg
-
-curl -s "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent" \
-  -H "Content-Type: application/json" -H "x-goog-api-key: $GEMINI_API_KEY" \
-  -d @/tmp/req.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).candidates?.[0]?.content?.parts?.[0]?.text))'
+brew install opus-tools
+say -v Milena -o v.aiff "Привет! Давай перенесём встречу на три часа дня."
+afconvert -f WAVE -d LEI16@48000 -c 1 v.aiff v48.wav
+opusenc --bitrate 32 --downmix-mono v48.wav voice.ogg
 ```
 
-Если Gemini не подойдёт — замена на Groq с `whisper-large-v3-turbo` меняет
-только `lib/transcribe.js`: интерфейс `transcribe(bytes) -> {summary, transcript}`
-специально узкий.
+Дальше — запрос к `generateContent` с `inline_data.mime_type = "audio/ogg"`.
+
+**Чего это НЕ доказывает:** тест шёл на синтезированной речи без шума. Реальная
+голосовуха с улицы, с перебивками и фоном — другая задача. Первый живой прогон
+покажет.
+
+Если качество на реальном звуке разочарует — отход на Groq с
+`whisper-large-v3-turbo` меняет только `lib/transcribe.js`: интерфейс
+`transcribe(bytes) -> {summary, transcript}` специально узкий.
 
 ## Запуск локально
 
